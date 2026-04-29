@@ -31,7 +31,7 @@ def call(Map config = [:]) {
 
         options {
             timeout(time: 30, unit: 'MINUTES')
-            disableConcurrentBuilds()
+            disableConcurrentBuilds(abortPrevious: true)
             buildDiscarder(logRotator(numToKeepStr: '10'))
         }
 
