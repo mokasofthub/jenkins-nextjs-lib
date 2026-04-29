@@ -20,11 +20,11 @@ def call(Map config = [:]) {
         }
 
         environment {
-            AWS_REGION     = awsRegion
-            ECR_REPOSITORY = ecrRepository
-            ECS_CLUSTER    = ecsCluster
-            ECS_SERVICE    = ecsService
-            CONTAINER_NAME = containerName
+            AWS_REGION     = "${awsRegion}"
+            ECR_REPOSITORY = "${ecrRepository}"
+            ECS_CLUSTER    = "${ecsCluster}"
+            ECS_SERVICE    = "${ecsService}"
+            CONTAINER_NAME = "${containerName}"
             IMAGE_TAG      = "${env.GIT_COMMIT?.take(7) ?: 'latest'}"
             NEXT_PUBLIC_FORMSPREE_FORM_ID = credentials('formspree-form-id')
         }
