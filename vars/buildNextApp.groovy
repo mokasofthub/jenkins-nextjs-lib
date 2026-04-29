@@ -235,10 +235,10 @@ print(json.dumps(td))
 
         post {
             success {
-                echo "✅ Pipeline passed on branch: ${env.BRANCH_NAME} — build #${env.BUILD_NUMBER}"
+                echo "✅ Pipeline passed on branch: ${env.GIT_BRANCH ?: env.BRANCH_NAME} — build #${env.BUILD_NUMBER}"
             }
             failure {
-                echo "❌ Pipeline failed on branch: ${env.BRANCH_NAME} — check build #${env.BUILD_NUMBER}"
+                echo "❌ Pipeline failed on branch: ${env.GIT_BRANCH ?: env.BRANCH_NAME} — check build #${env.BUILD_NUMBER}"
             }
             always {
                 sh 'docker image prune -f --filter "until=24h" || true'
