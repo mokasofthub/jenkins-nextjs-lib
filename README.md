@@ -21,7 +21,7 @@ A reusable Jenkins Shared Library that delivers a full CI/CD pipeline for any Ne
 **One call does all of this:**
 
 - All branches & PRs → Checkout · Install · Lint · Test · Build
-- `main` branch only → Docker Build & Push to ECR → Deploy to ECS Fargate → CloudFront cache invalidation
+- `main` branch only → Docker Build & Push to ECR → Deploy to ECS Fargate → Update Route 53 origin A record → CloudFront cache invalidation
 
 ---
 
@@ -67,7 +67,9 @@ buildNextApp(
     ecrRepository:             'moka-software-business',
     ecsCluster:                'moka-cluster',
     ecsService:                'moka-service',
-    cloudfrontDistributionId:  'EXXXXXXXXXXXXX',   // optional — omit to skip invalidation
+    cloudfrontDistributionId:  'EXXXXXXXXXXXXX',        // optional — omit to skip invalidation
+    route53HostedZoneId:       'ZXXXXXXXXXXXXX',        // optional — enables Update Origin IP stage
+    originRecordName:          'origin.example.com',   // FQDN of the Fargate task A record
 )
 ```
 
@@ -86,6 +88,8 @@ That is the entire `Jenkinsfile`. No other pipeline code is needed.
 | `ecsService` | **Yes** | — | ECS service name |
 | `containerName` | No | value of `ecrRepository` | Container name in the ECS task definition |
 | `cloudfrontDistributionId` | No | `''` | CloudFront distribution ID. Omit or leave empty to skip invalidation. |
+| `route53HostedZoneId` | No | `''` | Route 53 hosted zone ID. Required to enable the **Update Origin IP** stage. |
+| `originRecordName` | No | `''` | FQDN of the Route 53 A record that points to the ECS Fargate task (e.g. `origin.example.com`). Required alongside `route53HostedZoneId`. |
 
 ---
 
@@ -223,7 +227,11 @@ The AWS IAM user whose keys are stored in Jenkins needs the following minimum pe
         "ecs:RegisterTaskDefinition",
         "ecs:UpdateService",
         "ecs:DescribeServices",
+        "ecs:ListTasks",
+        "ecs:DescribeTasks",
+        "ec2:DescribeNetworkInterfaces",
         "iam:PassRole",
+        "route53:ChangeResourceRecordSets",
         "cloudfront:CreateInvalidation"
       ],
       "Resource": "*"
@@ -252,6 +260,7 @@ The AWS IAM user whose keys are stored in Jenkins needs the following minimum pe
 |---|---|
 | **Docker Build & Push** | Logs in to ECR, creates the repository if absent, applies the 5-image lifecycle policy, builds the image with `<git-sha>` and `latest` tags, pushes both. |
 | **Deploy to ECS** | Fetches the current task definition, swaps the container image to the new one, registers the new revision, calls `aws ecs update-service`, waits until `services-stable`. |
+| **Update Origin IP** | Resolves the public IP of the newly running Fargate task (via ENI) and upserts the Route 53 A record (e.g. `origin.example.com`) so CloudFront always reaches the live task. Skipped automatically if `route53HostedZoneId` or `originRecordName` is not set. |
 | **Invalidate CloudFront** | Calls `aws cloudfront create-invalidation --paths '/*'`. Skipped automatically if `cloudfrontDistributionId` is not set. |
 
 ### Post-build hooks (always run)
@@ -291,6 +300,10 @@ The AWS IAM user whose keys are stored in Jenkins needs the following minimum pe
       ├── aws ecs register-task-definition  →  new revision ARN
       ├── aws ecs update-service --task-definition <new ARN>
       ├── aws ecs wait services-stable
+      │
+      ├── aws ecs list-tasks + describe-tasks → get ENI ID
+      ├── aws ec2 describe-network-interfaces → get public IP
+      ├── aws route53 change-resource-record-sets (UPSERT origin.example.com → new IP)
       │
       └── aws cloudfront create-invalidation --paths '/*'
               │
@@ -341,15 +354,19 @@ The [`moka-software-business`](https://github.com/mokasofthub/moka-software-busn
 @Library('jenkins-nextjs-lib') _
 
 buildNextApp(
+    deployBranch:             'main',
     awsRegion:                'us-east-1',
     ecrRepository:            'moka-software-business',
     ecsCluster:               'moka-cluster',
     ecsService:               'moka-service',
-    cloudfrontDistributionId: 'EXXXXXXXXXXXXX',
+    containerName:            'moka-software-business',
+    cloudfrontDistributionId: 'E2MZ1JOJMAKL7T',
+    route53HostedZoneId:      'Z060171628JQ5P7XSLA4C',
+    originRecordName:         'origin.mokasoftwarebusness.com',
 )
 ```
 
-That is the entire pipeline definition — 8 lines, all stages handled by the library.
+That is the entire pipeline definition — 13 lines, all stages handled by the library.
 
 ---
 
