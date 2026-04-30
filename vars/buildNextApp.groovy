@@ -42,9 +42,10 @@ def call(Map config = [:]) {
 
     // Closure that returns true when the current build is on the deploy branch.
     // Used in both Docker and Deploy `when` blocks to avoid code duplication.
-    // The double check covers both multibranch pipelines (branch()) and single
-    // pipeline jobs where GIT_BRANCH is set to 'origin/main' instead of 'main'.
-    def onDeploy = { -> branch(deployBranch) || env.GIT_BRANCH == "origin/${deployBranch}" }
+    // NOTE: branch() is a `when` DSL condition — it cannot be used inside expression{}.
+    // Inside expression{}, it returns a truthy WhenCondition object on all branches.
+    // We check env.BRANCH_NAME (multibranch) and env.GIT_BRANCH (single pipeline) instead.
+    def onDeploy = { -> env.BRANCH_NAME == deployBranch || env.GIT_BRANCH == deployBranch || env.GIT_BRANCH == "origin/${deployBranch}" }
 
     // ── Pipeline ──────────────────────────────────────────────────────────────
     pipeline {
