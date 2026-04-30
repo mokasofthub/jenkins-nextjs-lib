@@ -26,14 +26,20 @@ def call(String state, String buildUrl) {
     def console   = "${buildUrl}console"            // Classic console output
 
     // ── Pending state ─────────────────────────────────────────────────────────
-    // Only one check is published: the console URL isn't useful yet since the
-    // build just started. The Blue Ocean check is set to IN_PROGRESS (spinner).
+    // Both checks are published as IN_PROGRESS so the developer sees all
+    // required checks (blue-ocean + console) with a spinner from the start.
     if (state == 'pending') {
         publishChecks(
             name:       'continuous-integration/jenkins/blue-ocean',
-            status:     'IN_PROGRESS',   // Shows a spinner on the GitHub PR page
+            status:     'IN_PROGRESS',
             summary:    'Build in progress…',
             detailsURL: blueOcean
+        )
+        publishChecks(
+            name:       'continuous-integration/jenkins/console',
+            status:     'IN_PROGRESS',
+            summary:    'Build in progress — logs will be available shortly',
+            detailsURL: console
         )
         return
     }

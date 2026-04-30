@@ -90,4 +90,3 @@ def call(Map config) {
         }
     }
 }
-}
