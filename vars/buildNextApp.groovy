@@ -339,7 +339,7 @@ print('change written')
             aborted {
                 publishChecks(
                     name:       'ci/jenkins',
-                    conclusion: 'ABORTED',
+                    conclusion: 'CANCELLED',
                     summary:    'Build aborted'
                 )
             }
