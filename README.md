@@ -240,6 +240,27 @@ The AWS IAM user whose keys are stored in Jenkins needs the following minimum pe
 }
 ```
 
+> **Note — `EcsOriginIPUpdate` inline policy**: `ecs:ListTasks`, `ecs:DescribeTasks`, `ec2:DescribeNetworkInterfaces`, and `route53:ChangeResourceRecordSets` are required by the **Update Origin IP** stage and are **not** included in the standard ECS managed policies. Attach them as an inline policy on the IAM user:
+>
+> ```bash
+> aws iam put-user-policy \
+>   --user-name <your-jenkins-iam-user> \
+>   --policy-name EcsOriginIPUpdate \
+>   --policy-document '{
+>     "Version": "2012-10-17",
+>     "Statement": [{
+>       "Effect": "Allow",
+>       "Action": [
+>         "ecs:ListTasks",
+>         "ecs:DescribeTasks",
+>         "ec2:DescribeNetworkInterfaces",
+>         "route53:ChangeResourceRecordSets"
+>       ],
+>       "Resource": "*"
+>     }]
+>   }'
+> ```
+
 ---
 
 ## Pipeline Stages
