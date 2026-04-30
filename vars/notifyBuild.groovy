@@ -1,91 +1,96 @@
 /**
- * notifyBuild — Publish GitHub PR status checks via the Jenkins Checks API plugin.
+ * notifyBuild — Post GitHub commit status checks via the Statuses API.
  *
- * What it does:
- *   For 'pending': marks the Blue Ocean check as IN_PROGRESS (build just started).
- *   For all other states: marks both checks as COMPLETED with the appropriate conclusion.
+ * Unlike the Checks API (publishChecks), commit statuses redirect the user
+ * DIRECTLY to the target URL when they click "Details" on the PR — no
+ * intermediate GitHub Checks page.
  *
- * Two checks are published per build so developers get two convenient links on the PR:
- *   • continuous-integration/jenkins/blue-ocean → visual pipeline view
- *   • continuous-integration/jenkins/console    → raw log output
+ * Two statuses are posted per build:
+ *   • continuous-integration/jenkins/blue-ocean → Blue Ocean pipeline view
+ *   • continuous-integration/jenkins/console    → raw console logs
  *
- * Requires: Checks API plugin (https://plugins.jenkins.io/checks-api)
- * Note: valid `conclusion` values — SUCCESS, FAILURE, NEUTRAL, CANCELED,
- *       TIME_OUT, ACTION_REQUIRED, SKIPPED (NOT "CANCELLED" with double-L)
+ * Requires: Jenkins credential 'github-token' (PAT with repo:status scope)
+ *           env.GIT_COMMIT must be set (always true after checkout scm)
+ *           env.GIT_URL must be set (always true after checkout scm)
  *
  * Usage:
- *   notifyBuild('pending',  env.BUILD_URL)   // call right after checkout
- *   notifyBuild('success',  env.BUILD_URL)   // call in post { success  { ... } }
- *   notifyBuild('failure',  env.BUILD_URL)   // call in post { failure  { ... } }
- *   notifyBuild('unstable', env.BUILD_URL)   // call in post { unstable { ... } }
- *   notifyBuild('aborted',  env.BUILD_URL)   // call in post { aborted  { ... } }
+ *   notifyBuild('pending',  env.BUILD_URL)
+ *   notifyBuild('success',  env.BUILD_URL)
+ *   notifyBuild('failure',  env.BUILD_URL)
+ *   notifyBuild('unstable', env.BUILD_URL)
+ *   notifyBuild('aborted',  env.BUILD_URL)
  */
 def call(String state, String buildUrl) {
-    // Build the deep-link URLs for each check's "Details" button on GitHub
-    def blueOcean = "${buildUrl}display/redirect"  // Blue Ocean pipeline view
-    def console   = "${buildUrl}console"            // Classic console output
 
-    // ── Pending state ─────────────────────────────────────────────────────────
-    // Both checks are published as IN_PROGRESS so the developer sees all
-    // required checks (blue-ocean + console) with a spinner from the start.
-    if (state == 'pending') {
-        publishChecks(
-            name:       'continuous-integration/jenkins/blue-ocean',
-            status:     'IN_PROGRESS',
-            summary:    'Build in progress…',
-            detailsURL: blueOcean
-        )
-        publishChecks(
-            name:       'continuous-integration/jenkins/console',
-            status:     'IN_PROGRESS',
-            summary:    'Build in progress — logs will be available shortly',
-            detailsURL: console
-        )
-        return
-    }
+    // ── Derive URLs ───────────────────────────────────────────────────────────
+    // Build the Blue Ocean deep-link from BUILD_URL:
+    //   .../job/<pipeline>/job/<branch>/<number>/
+    //   → .../blue/organizations/jenkins/<pipeline>/detail/<branch>/<number>/pipeline
+    def blueOcean = buildUrl.replaceAll(
+        '/job/([^/]+)/job/([^/]+)/(\\d+)/',
+        '/blue/organizations/jenkins/$1/detail/$2/$3/pipeline'
+    )
+    def console = "${buildUrl}console"
 
-    // ── Completed states ──────────────────────────────────────────────────────
-    // Map the Jenkins pipeline result to the GitHub Checks API conclusion enum.
-    // `unstable` (test failures) maps to FAILURE so the PR is blocked by default.
-    def conclusionMap = [
-        success  : 'SUCCESS',
-        failure  : 'FAILURE',
-        unstable : 'FAILURE',   // unstable = test failures → still block the PR
-        aborted  : 'CANCELED',  // single-L: the Checks API enum is CANCELED not CANCELLED
+    // ── Map Jenkins state → GitHub Statuses API state ─────────────────────────
+    // GitHub accepts: pending, success, failure, error
+    def githubStateMap = [
+        pending  : 'pending',
+        success  : 'success',
+        failure  : 'failure',
+        unstable : 'failure',  // test failures → block the PR
+        aborted  : 'error',
     ]
+    def githubState = githubStateMap[state] ?: 'error'
 
-    // Human-readable summary shown in the GitHub Checks detail panel
-    def summaryMap = [
-        success  : 'All checks passed',
-        failure  : 'Build failed — see Blue Ocean for details',
+    def blueOceanDesc = [
+        pending  : 'Build in progress…',
+        success  : 'Build succeeded',
+        failure  : 'Build failed',
         unstable : 'Build unstable (test failures)',
         aborted  : 'Build aborted',
     ]
-
-    // Slightly different copy for the console check (raw logs context)
-    def consoleSummaryMap = [
+    def consoleDesc = [
+        pending  : 'Build in progress — logs available shortly',
         success  : 'Build logs available',
         failure  : 'Build failed — see console logs',
         unstable : 'Test failures — see console logs',
         aborted  : 'Build aborted',
     ]
 
-    // Fallback to FAILURE for any unexpected state value
-    def conclusion = conclusionMap[state] ?: 'FAILURE'
+    // ── Post both statuses via GitHub API ─────────────────────────────────────
+    withCredentials([string(credentialsId: 'github-token', variable: 'GITHUB_TOKEN')]) {
+        script {
+            // Parse owner/repo from GIT_URL (supports both https and ssh formats)
+            // e.g. https://github.com/mokasofthub/moka-software-busness.git
+            //      git@github.com:mokasofthub/moka-software-busness.git
+            def repoSlug = env.GIT_URL
+                .replaceAll('.*github\\.com[:/]', '')
+                .replaceAll('\\.git$', '')
+            def sha = env.GIT_COMMIT
 
-    // Publish the Blue Ocean check (visual pipeline view)
-    publishChecks(
-        name:       'continuous-integration/jenkins/blue-ocean',
-        conclusion: conclusion,
-        summary:    summaryMap[state] ?: 'Build ended',
-        detailsURL: blueOcean
-    )
+            def apiBase = "https://api.github.com/repos/${repoSlug}/statuses/${sha}"
 
-    // Publish the console check (raw log output)
-    publishChecks(
-        name:       'continuous-integration/jenkins/console',
-        conclusion: conclusion,
-        summary:    consoleSummaryMap[state] ?: 'See console logs',
-        detailsURL: console
-    )
+            // Resolve descriptions outside the sh block to avoid single-quote conflicts
+            // inside the JSON payload (shell single-quoted strings can't contain single quotes)
+            def boDesc  = blueOceanDesc[state] ?: 'Build ended'
+            def conDesc = consoleDesc[state]   ?: 'See console logs'
+
+            // Post Blue Ocean status — "Details" clicks go directly to Blue Ocean
+            sh """
+                curl -s -X POST ${apiBase} \\
+                  -H "Authorization: token \$GITHUB_TOKEN" \\
+                  -H "Content-Type: application/json" \\
+                  -d '{"state":"${githubState}","target_url":"${blueOcean}","description":"${boDesc}","context":"continuous-integration/jenkins/blue-ocean"}'
+            """
+
+            // Post console status — "Details" clicks go directly to the console log
+            sh """
+                curl -s -X POST ${apiBase} \\
+                  -H "Authorization: token \$GITHUB_TOKEN" \\
+                  -H "Content-Type: application/json" \\
+                  -d '{"state":"${githubState}","target_url":"${console}","description":"${conDesc}","context":"continuous-integration/jenkins/console"}'
+            """
+        }
+    }
 }
