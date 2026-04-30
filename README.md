@@ -122,10 +122,12 @@ Install all of the following (restart Jenkins after):
 | Plugin | Why it is needed |
 |---|---|
 | **Pipeline** | Declarative pipeline support |
-| **GitHub** | Webhook listener (`/github-webhook/`) |
+| **GitHub** | Webhook listener (`/github-webhook/`) + `githubNotify` step |
 | **GitHub Branch Source** | Multibranch pipeline + PR builds |
 | **Credentials Binding** | Inject secrets as environment variables |
 | **Git** | Checkout stage |
+
+> **`githubNotify` requires the GitHub Plugin ≥ 1.29.** Once installed, the pipeline posts `pending / success / failure` commit statuses back to GitHub — these appear as checks on pull requests.
 
 ---
 
@@ -135,13 +137,23 @@ Go to: **Manage Jenkins → Credentials → System → Global credentials → Ad
 
 Add each credential below as **Secret text**:
 
-| Credential ID | Value |
-|---|---|
-| `aws-access-key-id` | Your AWS access key ID |
-| `aws-secret-access-key` | Your AWS secret access key |
-| `formspree-form-id` | Your Formspree form ID (injected at Docker build time) |
+| Credential ID | Type | Value |
+|---|---|---|
+| `aws-access-key-id` | Secret text | Your AWS access key ID |
+| `aws-secret-access-key` | Secret text | Your AWS secret access key |
+| `formspree-form-id` | Secret text | Your Formspree form ID (injected at Docker build time) |
+| `github-token` | Secret text | GitHub Personal Access Token with **`repo:status`** scope |
 
 > **Security note:** Never store AWS credentials in source code or `Jenkinsfile`. The library reads them via `withCredentials` and never prints them to the build log.
+
+#### GitHub Personal Access Token (for commit status checks)
+
+1. Go to **GitHub → Settings → Developer settings → Personal access tokens → Tokens (classic)**
+2. Click **Generate new token (classic)**
+3. Set a note (e.g. `jenkins-status-checks`) and select the **`repo:status`** scope only
+4. Copy the token and add it to Jenkins as a **Secret text** credential with ID `github-token`
+
+Then in your Jenkins job (Multibranch Pipeline or Pipeline), go to **Configure → GitHub → GitHub Servers → Advanced** and select the `github-token` credential. This is what `githubNotify` uses to post statuses.
 
 ---
 
@@ -164,7 +176,17 @@ This makes Jenkins start a build automatically on every push and pull request.
 1. Click **New Item** → **Multibranch Pipeline** → OK
 2. Under **Branch Sources**, add your GitHub repository
 3. Under **Build Configuration**, set the script path to `Jenkinsfile`
-4. Save — Jenkins will scan all branches and PRs immediately
+4. Under **GitHub Project**, set the project URL to `https://github.com/<org>/<repo>/` — required for `githubNotify` to resolve the correct repository
+5. Save — Jenkins will scan all branches and PRs immediately
+
+#### Verify commit status checks are working
+
+1. Open a PR on GitHub — you should see `ci/jenkins — pending` appear immediately after the build starts
+2. After the build completes, the status should turn green (✅ `ci/jenkins — All checks passed`) or red
+3. If the status does not appear:
+   - Check **Manage Jenkins → System Log** for `githubNotify` errors
+   - Verify the `github-token` credential has the `repo:status` scope
+   - Confirm the **GitHub Project URL** is set on the Jenkins job
 
 ---
 
