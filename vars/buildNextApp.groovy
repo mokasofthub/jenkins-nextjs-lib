@@ -1,351 +1,138 @@
+/**
+ * buildNextApp — Jenkins shared library entry point.
+ *
+ * Orchestrates CI/CD for a Next.js app deployed to AWS ECS Fargate.
+ * Delegates heavy lifting to helper vars: dockerEcr, deployEcs, notifyBuild.
+ *
+ * Minimal Jenkinsfile usage:
+ *   @Library('jenkins-nextjs-lib') _
+ *   buildNextApp(
+ *     ecrRepository: 'my-app',
+ *     ecsCluster:    'my-cluster',
+ *     ecsService:    'my-service'
+ *   )
+ */
 def call(Map config = [:]) {
-    def deployBranch        = config.deployBranch        ?: 'main'
-    def awsRegion           = config.awsRegion           ?: 'us-east-1'
-    def ecrRepository       = config.ecrRepository       ?: error('ecrRepository is required')
-    def ecsCluster          = config.ecsCluster          ?: error('ecsCluster is required')
-    def ecsService          = config.ecsService          ?: error('ecsService is required')
-    def containerName       = config.containerName       ?: ecrRepository
-    // cloudfrontDistributionId: optional — triggers a cache invalidation after deploy
-    // e.g. 'EXXXXXXXXXXXXX'
-    def cloudfrontDistId    = config.cloudfrontDistributionId ?: ''
-    // route53HostedZoneId + originRecordName: optional — updates the CloudFront origin A record
-    // after each deploy so the new Fargate task IP is used automatically
-    def r53HostedZoneId     = config.route53HostedZoneId ?: ''
-    def originRecordName    = config.originRecordName    ?: ''
 
+    // ── Configuration ─────────────────────────────────────────────────────────
+    // Branch that triggers Docker build + AWS deployment (all other branches
+    // only run Checkout → Install → Lint → Test → Build).
+    def deployBranch = config.deployBranch ?: 'main'
+
+    // Consolidate all config into a single map so it can be forwarded to
+    // dockerEcr() and deployEcs() with the `+` operator (map merge).
+    def cfg = [
+        awsRegion:                config.awsRegion               ?: 'us-east-1',
+        // Required: name of the ECR repository (e.g. 'moka-software')
+        ecrRepository:            config.ecrRepository           ?: error('ecrRepository is required'),
+        // Required: name of the ECS cluster
+        ecsCluster:               config.ecsCluster              ?: error('ecsCluster is required'),
+        // Required: name of the ECS service inside the cluster
+        ecsService:               config.ecsService              ?: error('ecsService is required'),
+        // Name of the Docker container in the task definition — defaults to the repo name
+        containerName:            config.containerName           ?: config.ecrRepository,
+        // Optional: CloudFront distribution ID — triggers /*  invalidation after each deploy
+        cloudfrontDistributionId: config.cloudfrontDistributionId ?: '',
+        // Optional: Route 53 hosted zone ID — needed to update the origin A record
+        // after each deploy (Fargate tasks get a new public IP on every restart)
+        route53HostedZoneId:      config.route53HostedZoneId     ?: '',
+        // Optional: FQDN of the Route 53 A record to upsert (e.g. 'origin.example.com')
+        originRecordName:         config.originRecordName        ?: '',
+    ]
+
+    // Closure that returns true when the current build is on the deploy branch.
+    // Used in both Docker and Deploy `when` blocks to avoid code duplication.
+    // The double check covers both multibranch pipelines (branch()) and single
+    // pipeline jobs where GIT_BRANCH is set to 'origin/main' instead of 'main'.
+    def onDeploy = { -> branch(deployBranch) || env.GIT_BRANCH == "origin/${deployBranch}" }
+
+    // ── Pipeline ──────────────────────────────────────────────────────────────
     pipeline {
         agent any
 
         triggers {
-            // Requires Jenkins GitHub Plugin
-            // GitHub webhook URL: https://<your-jenkins-host>/github-webhook/
-            githubPush()
-            cron('H 2 * * *')
+            githubPush()           // Triggered by GitHub webhook on every push
+            cron('H 2 * * *')     // Nightly build at ~2 AM to catch dependency drift
         }
 
         environment {
-            AWS_REGION     = "${awsRegion}"
-            ECR_REPOSITORY = "${ecrRepository}"
-            ECS_CLUSTER    = "${ecsCluster}"
-            ECS_SERVICE    = "${ecsService}"
-            CONTAINER_NAME = "${containerName}"
-            IMAGE_TAG      = "${env.GIT_COMMIT?.take(7) ?: 'latest'}"
+            // Short commit SHA used as the Docker image tag (e.g. 'a3f1c2b').
+            // Falls back to 'latest' if GIT_COMMIT is not available.
+            IMAGE_TAG = "${env.GIT_COMMIT?.take(7) ?: 'latest'}"
+
+            // Contact form ID injected at build time via Jenkins credential store.
+            // This avoids hardcoding the value in the Dockerfile or source code.
             NEXT_PUBLIC_FORMSPREE_FORM_ID = credentials('formspree-form-id')
         }
 
         options {
-            timeout(time: 30, unit: 'MINUTES')
-            disableConcurrentBuilds(abortPrevious: true)
-            buildDiscarder(logRotator(numToKeepStr: '10'))
+            timeout(time: 30, unit: 'MINUTES')         // Kill runaway builds
+            disableConcurrentBuilds(abortPrevious: true) // Cancel outdated PR builds
+            buildDiscarder(logRotator(numToKeepStr: '10')) // Keep only the last 10 builds
         }
 
         stages {
 
+            // ── CI stages (all branches) ──────────────────────────────────────
+
             stage('Checkout') {
                 steps {
                     checkout scm
-                    echo "Branch: ${env.GIT_BRANCH} | Commit: ${env.GIT_COMMIT}"
-                    publishChecks(
-                        name:    'ci/jenkins',
-                        status:  'IN_PROGRESS',
-                        summary: 'Build in progress…'
-                    )
+                    // Mark the GitHub PR check as "in progress" right after checkout
+                    // so developers see immediate feedback without waiting for all stages.
+                    notifyBuild('pending', env.BUILD_URL)
                 }
             }
 
             stage('Install') {
                 steps {
-                    sh 'node --version && npm --version'
+                    // --prefer-offline reuses the npm cache to speed up builds.
+                    // `ci` (vs `install`) ensures package-lock.json is strictly respected.
                     sh 'npm ci --prefer-offline'
                 }
             }
 
-            stage('Lint') {
-                steps {
-                    sh 'npm run lint'
-                }
-            }
+            stage('Lint')  { steps { sh 'npm run lint'  } }
+            stage('Test')  { steps { sh 'npm test'      } }
+            stage('Build') { steps { sh 'npm run build' } }
 
-            stage('Test') {
-                steps {
-                    sh 'npm test'
-                }
-            }
-
-            stage('Build') {
-                steps {
-                    sh 'npm run build'
-                }
-            }
+            // ── CD stages (deploy branch only) ───────────────────────────────
 
             stage('Docker Build & Push') {
-                when {
-                    anyOf {
-                        branch deployBranch
-                        expression { env.GIT_BRANCH == "origin/${deployBranch}" }
-                    }
-                }
+                // Skip this stage on feature branches to save time and ECR storage.
+                when { expression { onDeploy() } }
                 steps {
-                    withCredentials([
-                        string(credentialsId: 'aws-access-key-id',     variable: 'AWS_ACCESS_KEY_ID'),
-                        string(credentialsId: 'aws-secret-access-key', variable: 'AWS_SECRET_ACCESS_KEY')
-                    ]) {
-                        script {
-                            def accountId = sh(
-                                script: 'aws sts get-caller-identity --query Account --output text',
-                                returnStdout: true
-                            ).trim()
-
-                            env.ECR_REGISTRY     = "${accountId}.dkr.ecr.${awsRegion}.amazonaws.com"
-                            env.IMAGE_URI        = "${env.ECR_REGISTRY}/${ecrRepository}:${env.IMAGE_TAG}"
-                            env.IMAGE_URI_LATEST = "${env.ECR_REGISTRY}/${ecrRepository}:latest"
-
-                            sh """
-                                aws ecr get-login-password --region ${awsRegion} | \
-                                docker login --username AWS --password-stdin ${env.ECR_REGISTRY}
-                            """
-
-                            sh """
-                                aws ecr describe-repositories \
-                                    --repository-names ${ecrRepository} \
-                                    --region ${awsRegion} \
-                                || aws ecr create-repository \
-                                    --repository-name ${ecrRepository} \
-                                    --region ${awsRegion}
-                            """
-
-                            sh """
-                                aws ecr put-lifecycle-policy \
-                                    --repository-name ${ecrRepository} \
-                                    --region ${awsRegion} \
-                                    --lifecycle-policy-text '{
-                                      "rules": [{
-                                        "rulePriority": 1,
-                                        "description": "Keep last 5 images",
-                                        "selection": {
-                                          "tagStatus": "any",
-                                          "countType": "imageCountMoreThan",
-                                          "countNumber": 5
-                                        },
-                                        "action": { "type": "expire" }
-                                      }]
-                                    }'
-                            """
-
-                            sh """
-                                docker build \
-                                    --build-arg NEXT_PUBLIC_FORMSPREE_FORM_ID=${env.NEXT_PUBLIC_FORMSPREE_FORM_ID} \
-                                    --tag ${env.IMAGE_URI} \
-                                    --tag ${env.IMAGE_URI_LATEST} \
-                                    .
-                            """
-                            sh "docker push ${env.IMAGE_URI}"
-                            sh "docker push ${env.IMAGE_URI_LATEST}"
-                        }
-                    }
+                    // Merge cfg with the runtime values that are only available
+                    // after the pipeline has started (IMAGE_TAG, credentials).
+                    dockerEcr(cfg + [
+                        imageTag:  env.IMAGE_TAG,
+                        buildArgs: [NEXT_PUBLIC_FORMSPREE_FORM_ID: env.NEXT_PUBLIC_FORMSPREE_FORM_ID]
+                    ])
                 }
             }
 
-            stage('Deploy to ECS') {
-                when {
-                    anyOf {
-                        branch deployBranch
-                        expression { env.GIT_BRANCH == "origin/${deployBranch}" }
-                    }
-                }
+            stage('Deploy to AWS') {
+                // Runs after a successful Docker push — deploys the new image to ECS,
+                // optionally updates the Route 53 origin record, and invalidates CloudFront.
+                when { expression { onDeploy() } }
                 steps {
-                    withCredentials([
-                        string(credentialsId: 'aws-access-key-id',     variable: 'AWS_ACCESS_KEY_ID'),
-                        string(credentialsId: 'aws-secret-access-key', variable: 'AWS_SECRET_ACCESS_KEY')
-                    ]) {
-                        script {
-                            sh """
-                                aws ecs describe-task-definition \
-                                    --task-definition ${containerName} \
-                                    --region ${awsRegion} \
-                                    --query taskDefinition \
-                                    > /tmp/task-def.json
-                            """
-
-                            sh """
-                                NEW_TASK_DEF=\$(python3 -c "
-import json
-with open('/tmp/task-def.json') as f:
-    td = json.load(f)
-for c in td['containerDefinitions']:
-    if c['name'] == '${containerName}':
-        c['image'] = '${env.IMAGE_URI}'
-for key in ['taskDefinitionArn','revision','status','requiresAttributes',
-            'compatibilities','registeredAt','registeredBy']:
-    td.pop(key, None)
-print(json.dumps(td))
-")
-                                echo "\$NEW_TASK_DEF" > /tmp/new-task-def.json
-
-                                NEW_ARN=\$(aws ecs register-task-definition \
-                                    --cli-input-json file:///tmp/new-task-def.json \
-                                    --region ${awsRegion} \
-                                    --query 'taskDefinition.taskDefinitionArn' \
-                                    --output text)
-
-                                echo "Registered task def: \$NEW_ARN"
-
-                                # No ALB: stop old task first, start new one.
-                                # ~5-10s downtime acceptable for portfolio site.
-                                # Add ALB later to get zero-downtime rolling deploy.
-                                aws ecs update-service \
-                                    --cluster ${ecsCluster} \
-                                    --service ${ecsService} \
-                                    --task-definition \$NEW_ARN \
-                                    --deployment-configuration minimumHealthyPercent=0,maximumPercent=100 \
-                                    --region ${awsRegion}
-                            """
-
-                            sh """
-                                aws ecs wait services-stable \
-                                    --cluster ${ecsCluster} \
-                                    --services ${ecsService} \
-                                    --region ${awsRegion}
-                            """
-
-                            echo "✅ Deployment complete — image: ${env.IMAGE_URI}"
-                        }
-                    }
-                }
-            }
-
-            // ── Update CloudFront origin A record with new Fargate task IP ────
-            stage('Update Origin IP') {
-                when {
-                    allOf {
-                        anyOf {
-                            branch deployBranch
-                            expression { env.GIT_BRANCH == "origin/${deployBranch}" }
-                        }
-                        expression { return r53HostedZoneId != '' && originRecordName != '' }
-                    }
-                }
-                steps {
-                    withCredentials([
-                        string(credentialsId: 'aws-access-key-id',     variable: 'AWS_ACCESS_KEY_ID'),
-                        string(credentialsId: 'aws-secret-access-key', variable: 'AWS_SECRET_ACCESS_KEY')
-                    ]) {
-                        script {
-                            sh """
-                                TASK_ARN=\$(aws ecs list-tasks \\
-                                    --cluster ${ecsCluster} \\
-                                    --service-name ${ecsService} \\
-                                    --region ${awsRegion} \\
-                                    --query 'taskArns[0]' --output text)
-
-                                ENI_ID=\$(aws ecs describe-tasks \\
-                                    --cluster ${ecsCluster} \\
-                                    --tasks "\$TASK_ARN" \\
-                                    --region ${awsRegion} \\
-                                    --query 'tasks[0].attachments[0].details[?name==`networkInterfaceId`].value' \\
-                                    --output text)
-
-                                NEW_IP=\$(aws ec2 describe-network-interfaces \\
-                                    --network-interface-ids "\$ENI_ID" \\
-                                    --region ${awsRegion} \\
-                                    --query 'NetworkInterfaces[0].Association.PublicIp' \\
-                                    --output text)
-
-                                echo "New task IP: \$NEW_IP"
-
-                                python3 -c "
-import json, subprocess
-change = {
-  'Comment': 'Update ECS Fargate origin IP',
-  'Changes': [{
-    'Action': 'UPSERT',
-    'ResourceRecordSet': {
-      'Name': '${originRecordName}',
-      'Type': 'A',
-      'TTL': 60,
-      'ResourceRecords': [{'Value': '\$NEW_IP'}]
-    }
-  }]
-}
-with open('/tmp/r53-update.json','w') as f:
-    json.dump(change, f)
-print('change written')
-"
-
-                                aws route53 change-resource-record-sets \\
-                                    --hosted-zone-id ${r53HostedZoneId} \\
-                                    --change-batch file:///tmp/r53-update.json \\
-                                    --no-cli-pager
-
-                                echo "✅ Origin record updated to \$NEW_IP"
-                            """
-                        }
-                    }
-                }
-            }
-
-            // ── CloudFront cache invalidation after deploy ────────────────────
-            stage('Invalidate CloudFront') {
-                when {
-                    allOf {
-                        anyOf {
-                            branch deployBranch
-                            expression { env.GIT_BRANCH == "origin/${deployBranch}" }
-                        }
-                        expression { return cloudfrontDistId != '' }
-                    }
-                }
-                steps {
-                    withCredentials([
-                        string(credentialsId: 'aws-access-key-id',     variable: 'AWS_ACCESS_KEY_ID'),
-                        string(credentialsId: 'aws-secret-access-key', variable: 'AWS_SECRET_ACCESS_KEY')
-                    ]) {
-                        sh """
-                            aws cloudfront create-invalidation \
-                                --distribution-id ${cloudfrontDistId} \
-                                --paths '/*' \
-                                --region us-east-1
-                        """
-                        echo "✅ CloudFront cache invalidated"
-                    }
+                    // env.IMAGE_URI is set by dockerEcr() in the previous stage.
+                    deployEcs(cfg + [imageUri: env.IMAGE_URI])
                 }
             }
         }
 
+        // ── Post-build notifications ──────────────────────────────────────────
+        // Each block publishes two GitHub checks: Blue Ocean link + console link.
         post {
-            success {
-                echo "✅ Pipeline passed on branch: ${env.GIT_BRANCH ?: env.BRANCH_NAME} — build #${env.BUILD_NUMBER}"
-                publishChecks(
-                    name:       'ci/jenkins',
-                    conclusion: 'SUCCESS',
-                    summary:    'All checks passed'
-                )
-            }
-            failure {
-                echo "❌ Pipeline failed on branch: ${env.GIT_BRANCH ?: env.BRANCH_NAME} — check build #${env.BUILD_NUMBER}"
-                publishChecks(
-                    name:       'ci/jenkins',
-                    conclusion: 'FAILURE',
-                    summary:    'Build failed — check Jenkins logs'
-                )
-            }
-            unstable {
-                publishChecks(
-                    name:       'ci/jenkins',
-                    conclusion: 'FAILURE',
-                    summary:    'Build unstable (test failures)'
-                )
-            }
-            aborted {
-                publishChecks(
-                    name:       'ci/jenkins',
-                    conclusion: 'CANCELED',
-                    summary:    'Build aborted'
-                )
-            }
+            success  { notifyBuild('success',  env.BUILD_URL) }
+            failure  { notifyBuild('failure',  env.BUILD_URL) }
+            unstable { notifyBuild('unstable', env.BUILD_URL) }  // Test failures
+            aborted  { notifyBuild('aborted',  env.BUILD_URL) }
             always {
-                sh 'docker image prune -f --filter "until=24h" || true'
-                cleanWs()
+                // Remove dangling/unused Docker layers to prevent disk exhaustion.
+                sh 'docker image prune -f || true'
+                cleanWs()  // Wipe the workspace so the next build starts clean
             }
         }
     }
