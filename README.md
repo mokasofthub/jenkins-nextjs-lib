@@ -32,7 +32,7 @@ vars/
 ├── buildNextApp.groovy   — Entry point: pipeline orchestrator (~130 lines)
 ├── dockerEcr.groovy      — Docker build + ECR push + lifecycle policy
 ├── deployEcs.groovy      — ECS deploy + Route 53 origin IP update + CloudFront invalidation
-└── notifyBuild.groovy    — GitHub PR status checks via the Checks API plugin
+└── notifyBuild.groovy    — GitHub commit status checks via the Commit Statuses API
 ```
 
 How they relate:
@@ -151,11 +151,10 @@ Install all of the following (restart Jenkins after):
 | **Pipeline** | Declarative pipeline support |
 | **GitHub** | Webhook listener (`/github-webhook/`) + push triggers |
 | **GitHub Branch Source** | Multibranch pipeline + PR builds |
-| **Checks API** | `publishChecks` step — posts ✅/❌ status checks to GitHub PRs |
 | **Credentials Binding** | Inject secrets as environment variables |
 | **Git** | Checkout stage |
 
-> The library uses the **Checks API plugin** (not `githubNotify`) to post PR status checks. It publishes two named checks per build: `continuous-integration/jenkins/blue-ocean` and `continuous-integration/jenkins/console`.
+> The library posts two **commit statuses** per build via the [GitHub Statuses API](https://docs.github.com/en/rest/commits/statuses) (not the Checks API). Clicking **Details** on a PR redirects the user **directly** to Jenkins — no intermediate GitHub Checks page.
 
 ---
 
@@ -170,18 +169,16 @@ Add each credential below as **Secret text**:
 | `aws-access-key-id` | Secret text | Your AWS access key ID |
 | `aws-secret-access-key` | Secret text | Your AWS secret access key |
 | `formspree-form-id` | Secret text | Your Formspree form ID (injected at Docker build time) |
-| `github-token` | Secret text | GitHub Personal Access Token with **`repo`** scope — used by GitHub Servers config |
+| `github-token` | Secret text | GitHub Personal Access Token with **`repo:status`** scope — used to post commit statuses |
 
 > **Security note:** Never store AWS credentials in source code or `Jenkinsfile`. The library reads them via `withCredentials` and never prints them to the build log.
 
-#### GitHub Personal Access Token (for PR checks)
+#### GitHub Personal Access Token (for commit statuses)
 
 1. Go to **GitHub → Settings → Developer settings → Personal access tokens → Tokens (classic)**
 2. Click **Generate new token (classic)**
-3. Set a note (e.g. `jenkins-checks-api`) and select the **`repo`** scope
+3. Set a note (e.g. `jenkins-commit-status`) and select the **`repo:status`** scope (fine-grained: only allows writing commit statuses — no code access needed)
 4. Copy the token and add it to Jenkins as a **Secret text** credential with ID `github-token`
-
-Then go to **Manage Jenkins → System → GitHub Servers → Add GitHub Server** and select the `github-token` credential. The Checks API plugin uses this connection to post status checks back to GitHub.
 
 ---
 
@@ -210,12 +207,12 @@ This makes Jenkins start a build automatically on every push and pull request.
 #### Verify commit status checks are working
 
 1. Open a PR on GitHub — you should see `continuous-integration/jenkins/blue-ocean — pending` appear immediately after checkout
-2. After the build completes, both checks (`blue-ocean` and `console`) should show ✅ or ❌
-3. If checks do not appear:
-   - Check **Manage Jenkins → System Log** for `publishChecks` errors
-   - Verify **GitHub Servers** is configured with a valid `github-token` credential
-   - Confirm the **GitHub Project URL** is set on the Jenkins job (`Configure → General → GitHub project`)
-   - Verify the Checks API plugin is installed and up to date
+2. After the build completes, both statuses (`blue-ocean` and `console`) should show ✅ or ❌
+3. Click **Details** on either status → you should land **directly** on the Jenkins Blue Ocean or console page
+4. If statuses do not appear:
+   - Check the build console for `curl` errors (look for `HTTP 401` or `HTTP 422`)
+   - Verify `github-token` is a PAT with `repo:status` scope
+   - Confirm `env.GIT_COMMIT` and `env.GIT_URL` are set (always true after `checkout scm`)
 
 ---
 
@@ -347,9 +344,9 @@ The AWS IAM user whose keys are stored in Jenkins needs the following minimum pe
 
 ## GitHub PR Checks
 
-The library uses the **Checks API plugin** (`publishChecks` step) to post two named status checks on every PR:
+The library posts two **commit statuses** per build via `curl` against the [GitHub Statuses API](https://docs.github.com/en/rest/commits/statuses). Unlike the Checks API, commit statuses redirect **directly** to Jenkins when clicking Details.
 
-| Check name | Links to |
+| Status context | Links to |
 |---|---|
 | `continuous-integration/jenkins/blue-ocean` | Blue Ocean visual pipeline view |
 | `continuous-integration/jenkins/console` | Raw console output |
