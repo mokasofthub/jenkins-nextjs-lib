@@ -45,6 +45,11 @@ def call(Map config = [:]) {
                 steps {
                     checkout scm
                     echo "Branch: ${env.GIT_BRANCH} | Commit: ${env.GIT_COMMIT}"
+                    githubNotify(
+                        context:     'ci/jenkins',
+                        status:      'PENDING',
+                        description: 'Build in progress…'
+                    )
                 }
             }
 
@@ -310,9 +315,33 @@ print('change written')
         post {
             success {
                 echo "✅ Pipeline passed on branch: ${env.GIT_BRANCH ?: env.BRANCH_NAME} — build #${env.BUILD_NUMBER}"
+                githubNotify(
+                    context:     'ci/jenkins',
+                    status:      'SUCCESS',
+                    description: 'All checks passed'
+                )
             }
             failure {
                 echo "❌ Pipeline failed on branch: ${env.GIT_BRANCH ?: env.BRANCH_NAME} — check build #${env.BUILD_NUMBER}"
+                githubNotify(
+                    context:     'ci/jenkins',
+                    status:      'FAILURE',
+                    description: 'Build failed — check Jenkins logs'
+                )
+            }
+            unstable {
+                githubNotify(
+                    context:     'ci/jenkins',
+                    status:      'FAILURE',
+                    description: 'Build unstable (test failures)'
+                )
+            }
+            aborted {
+                githubNotify(
+                    context:     'ci/jenkins',
+                    status:      'ERROR',
+                    description: 'Build aborted'
+                )
             }
             always {
                 sh 'docker image prune -f --filter "until=24h" || true'
