@@ -20,8 +20,34 @@ A reusable Jenkins Shared Library that delivers a full CI/CD pipeline for any Ne
 
 **One call does all of this:**
 
-- All branches & PRs → Checkout · Install · Lint · Test · Build
+- All branches & PRs → Checkout · Install · Lint · Test · Build · GitHub PR status check
 - `main` branch only → Docker Build & Push to ECR → Deploy to ECS Fargate → Update Route 53 origin A record → CloudFront cache invalidation
+
+### Library structure
+
+The pipeline logic is split into four focused files, each with a single responsibility:
+
+```
+vars/
+├── buildNextApp.groovy   — Entry point: pipeline orchestrator (~130 lines)
+├── dockerEcr.groovy      — Docker build + ECR push + lifecycle policy
+├── deployEcs.groovy      — ECS deploy + Route 53 origin IP update + CloudFront invalidation
+└── notifyBuild.groovy    — GitHub PR status checks via the Checks API plugin
+```
+
+How they relate:
+
+```
+buildNextApp
+│
+├── notifyBuild('pending')           ← right after checkout (spinner on PR)
+├── dockerEcr(...)                   ← Docker Build & Push stage
+├── deployEcs(...)                   ← Deploy to AWS stage
+│     ├── ECS service update
+│     ├── Route 53 A record update   (only if route53HostedZoneId is set)
+│     └── CloudFront invalidation    (only if cloudfrontDistributionId is set)
+└── notifyBuild('success'|'failure'|...) ← post block (✅ or ❌ on PR)
+```
 
 ---
 
@@ -35,6 +61,7 @@ A reusable Jenkins Shared Library that delivers a full CI/CD pipeline for any Ne
 - [Required Credentials](#required-credentials)
 - [IAM Permissions](#iam-permissions)
 - [Pipeline Stages](#pipeline-stages)
+- [GitHub PR Checks](#github-pr-checks)
 - [Architecture](#architecture)
 - [Consuming Repo Example](#consuming-repo-example)
 - [License](#license)
@@ -43,13 +70,13 @@ A reusable Jenkins Shared Library that delivers a full CI/CD pipeline for any Ne
 
 ## How It Works
 
-The library lives in `vars/buildNextApp.groovy`. When you call `buildNextApp(...)` from your project's `Jenkinsfile`, it:
+When you call `buildNextApp(...)` from your `Jenkinsfile`, it generates a complete declarative `pipeline { ... }` block. The heavy AWS logic is delegated to three helper files so `buildNextApp.groovy` stays readable at a glance.
 
-1. Generates a full `pipeline { ... }` block dynamically with all stages pre-wired.
-2. Runs CI stages (install, lint, test, build) on **every** branch and pull request.
-3. Runs deploy stages (Docker build, ECR push, ECS update, CloudFront invalidation) **only** when the commit lands on the configured deploy branch (default: `main`).
-4. Automatically creates the ECR repository if it does not exist, and applies a lifecycle policy to keep only the 5 most recent images.
-5. Registers a new ECS task definition revision pointing to the freshly pushed image, then calls `aws ecs update-service` and waits for the service to stabilise before marking the build green.
+1. **Checkout** — clones the repo, then immediately calls `notifyBuild('pending')` to show a spinner on the GitHub PR.
+2. **CI stages** (Install → Lint → Test → Build) run on **every** branch and PR.
+3. **Docker Build & Push** (`dockerEcr`) — logs in to ECR, creates the repository if it does not exist, enforces a 5-image lifecycle policy, builds the image tagged with the short git SHA and `latest`, then pushes both.
+4. **Deploy to AWS** (`deployEcs`) — fetches the ECS task definition, patches the container image via Python, registers a new revision, calls `aws ecs update-service`, and waits for stability. Optionally updates Route 53 and invalidates CloudFront.
+5. **Post block** — calls `notifyBuild('success'|'failure'|'unstable'|'aborted')` to post the final check status to GitHub.
 
 ---
 
@@ -122,12 +149,13 @@ Install all of the following (restart Jenkins after):
 | Plugin | Why it is needed |
 |---|---|
 | **Pipeline** | Declarative pipeline support |
-| **GitHub** | Webhook listener (`/github-webhook/`) + `githubNotify` step |
+| **GitHub** | Webhook listener (`/github-webhook/`) + push triggers |
 | **GitHub Branch Source** | Multibranch pipeline + PR builds |
+| **Checks API** | `publishChecks` step — posts ✅/❌ status checks to GitHub PRs |
 | **Credentials Binding** | Inject secrets as environment variables |
 | **Git** | Checkout stage |
 
-> **`githubNotify` requires the GitHub Plugin ≥ 1.29.** Once installed, the pipeline posts `pending / success / failure` commit statuses back to GitHub — these appear as checks on pull requests.
+> The library uses the **Checks API plugin** (not `githubNotify`) to post PR status checks. It publishes two named checks per build: `continuous-integration/jenkins/blue-ocean` and `continuous-integration/jenkins/console`.
 
 ---
 
@@ -142,18 +170,18 @@ Add each credential below as **Secret text**:
 | `aws-access-key-id` | Secret text | Your AWS access key ID |
 | `aws-secret-access-key` | Secret text | Your AWS secret access key |
 | `formspree-form-id` | Secret text | Your Formspree form ID (injected at Docker build time) |
-| `github-token` | Secret text | GitHub Personal Access Token with **`repo:status`** scope |
+| `github-token` | Secret text | GitHub Personal Access Token with **`repo`** scope — used by GitHub Servers config |
 
 > **Security note:** Never store AWS credentials in source code or `Jenkinsfile`. The library reads them via `withCredentials` and never prints them to the build log.
 
-#### GitHub Personal Access Token (for commit status checks)
+#### GitHub Personal Access Token (for PR checks)
 
 1. Go to **GitHub → Settings → Developer settings → Personal access tokens → Tokens (classic)**
 2. Click **Generate new token (classic)**
-3. Set a note (e.g. `jenkins-status-checks`) and select the **`repo:status`** scope only
+3. Set a note (e.g. `jenkins-checks-api`) and select the **`repo`** scope
 4. Copy the token and add it to Jenkins as a **Secret text** credential with ID `github-token`
 
-Then in your Jenkins job (Multibranch Pipeline or Pipeline), go to **Configure → GitHub → GitHub Servers → Advanced** and select the `github-token` credential. This is what `githubNotify` uses to post statuses.
+Then go to **Manage Jenkins → System → GitHub Servers → Add GitHub Server** and select the `github-token` credential. The Checks API plugin uses this connection to post status checks back to GitHub.
 
 ---
 
@@ -181,12 +209,13 @@ This makes Jenkins start a build automatically on every push and pull request.
 
 #### Verify commit status checks are working
 
-1. Open a PR on GitHub — you should see `ci/jenkins — pending` appear immediately after the build starts
-2. After the build completes, the status should turn green (✅ `ci/jenkins — All checks passed`) or red
-3. If the status does not appear:
-   - Check **Manage Jenkins → System Log** for `githubNotify` errors
-   - Verify the `github-token` credential has the `repo:status` scope
-   - Confirm the **GitHub Project URL** is set on the Jenkins job
+1. Open a PR on GitHub — you should see `continuous-integration/jenkins/blue-ocean — pending` appear immediately after checkout
+2. After the build completes, both checks (`blue-ocean` and `console`) should show ✅ or ❌
+3. If checks do not appear:
+   - Check **Manage Jenkins → System Log** for `publishChecks` errors
+   - Verify **GitHub Servers** is configured with a valid `github-token` credential
+   - Confirm the **GitHub Project URL** is set on the Jenkins job (`Configure → General → GitHub project`)
+   - Verify the Checks API plugin is installed and up to date
 
 ---
 
@@ -299,20 +328,55 @@ The AWS IAM user whose keys are stored in Jenkins needs the following minimum pe
 
 ### Stages that run only on the deploy branch (`main`)
 
-| Stage | What it does |
-|---|---|
-| **Docker Build & Push** | Logs in to ECR, creates the repository if absent, applies the 5-image lifecycle policy, builds the image with `<git-sha>` and `latest` tags, pushes both. |
-| **Deploy to ECS** | Fetches the current task definition, swaps the container image to the new one, registers the new revision, calls `aws ecs update-service`, waits until `services-stable`. |
-| **Update Origin IP** | Resolves the public IP of the newly running Fargate task (via ENI) and upserts the Route 53 A record (e.g. `origin.example.com`) so CloudFront always reaches the live task. Skipped automatically if `route53HostedZoneId` or `originRecordName` is not set. |
-| **Invalidate CloudFront** | Calls `aws cloudfront create-invalidation --paths '/*'`. Skipped automatically if `cloudfrontDistributionId` is not set. |
+| Stage | File | What it does |
+|---|---|---|
+| **Docker Build & Push** | `dockerEcr.groovy` | Logs in to ECR, creates the repository if absent, applies the 5-image lifecycle policy, builds the image with `<git-sha>` and `latest` tags, pushes both. |
+| **Deploy to AWS** | `deployEcs.groovy` | Orchestrates three sub-steps in sequence: ① ECS task definition update + service rollout + stability wait, ② Route 53 A record upsert with the new Fargate task IP (skipped if `route53HostedZoneId` not set), ③ CloudFront invalidation (skipped if `cloudfrontDistributionId` not set). |
 
 ### Post-build hooks (always run)
 
 | Hook | What it does |
 |---|---|
-| `success` | Logs branch name and build number |
-| `failure` | Logs branch name and build number |
-| `always` | `docker image prune -f --filter "until=24h"` to reclaim disk space; `cleanWs()` to clean the workspace |
+| `success` | `notifyBuild('success')` → posts ✅ to both GitHub checks |
+| `failure` | `notifyBuild('failure')` → posts ❌ to both GitHub checks |
+| `unstable` | `notifyBuild('unstable')` → posts ❌ FAILURE (test failures block the PR) |
+| `aborted` | `notifyBuild('aborted')` → posts CANCELED to both GitHub checks |
+| `always` | `docker image prune -f` to reclaim disk space; `cleanWs()` to wipe the workspace |
+
+---
+
+## GitHub PR Checks
+
+The library uses the **Checks API plugin** (`publishChecks` step) to post two named status checks on every PR:
+
+| Check name | Links to |
+|---|---|
+| `continuous-integration/jenkins/blue-ocean` | Blue Ocean visual pipeline view |
+| `continuous-integration/jenkins/console` | Raw console output |
+
+### Check lifecycle
+
+```
+git push / PR opened
+      │
+      ▼
+  Checkout stage
+      │
+      └── notifyBuild('pending') → 🔄 IN_PROGRESS spinner on PR
+
+  ... all stages run ...
+
+  post { success }  → notifyBuild('success')  → ✅ SUCCESS  on both checks
+  post { failure }  → notifyBuild('failure')  → ❌ FAILURE  on both checks
+  post { unstable } → notifyBuild('unstable') → ❌ FAILURE  on both checks
+  post { aborted }  → notifyBuild('aborted')  → ⊘ CANCELED on both checks
+```
+
+### Require checks before merging
+
+In your GitHub repository go to **Settings → Branches → Branch protection rules → Edit (main)** and enable:
+- ✅ Require status checks to pass before merging
+- Add `continuous-integration/jenkins/blue-ocean` as a required check
 
 ---
 
