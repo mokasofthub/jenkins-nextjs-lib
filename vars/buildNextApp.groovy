@@ -8,6 +8,10 @@ def call(Map config = [:]) {
     // cloudfrontDistributionId: optional — triggers a cache invalidation after deploy
     // e.g. 'EXXXXXXXXXXXXX'
     def cloudfrontDistId    = config.cloudfrontDistributionId ?: ''
+    // route53HostedZoneId + originRecordName: optional — updates the CloudFront origin A record
+    // after each deploy so the new Fargate task IP is used automatically
+    def r53HostedZoneId     = config.route53HostedZoneId ?: ''
+    def originRecordName    = config.originRecordName    ?: ''
 
     pipeline {
         agent any
@@ -200,6 +204,76 @@ print(json.dumps(td))
                             """
 
                             echo "✅ Deployment complete — image: ${env.IMAGE_URI}"
+                        }
+                    }
+                }
+            }
+
+            // ── Update CloudFront origin A record with new Fargate task IP ────
+            stage('Update Origin IP') {
+                when {
+                    allOf {
+                        anyOf {
+                            branch deployBranch
+                            expression { env.GIT_BRANCH == "origin/${deployBranch}" }
+                        }
+                        expression { return r53HostedZoneId != '' && originRecordName != '' }
+                    }
+                }
+                steps {
+                    withCredentials([
+                        string(credentialsId: 'aws-access-key-id',     variable: 'AWS_ACCESS_KEY_ID'),
+                        string(credentialsId: 'aws-secret-access-key', variable: 'AWS_SECRET_ACCESS_KEY')
+                    ]) {
+                        script {
+                            sh """
+                                TASK_ARN=\$(aws ecs list-tasks \\
+                                    --cluster ${ecsCluster} \\
+                                    --service-name ${ecsService} \\
+                                    --region ${awsRegion} \\
+                                    --query 'taskArns[0]' --output text)
+
+                                ENI_ID=\$(aws ecs describe-tasks \\
+                                    --cluster ${ecsCluster} \\
+                                    --tasks "\$TASK_ARN" \\
+                                    --region ${awsRegion} \\
+                                    --query 'tasks[0].attachments[0].details[?name==`networkInterfaceId`].value' \\
+                                    --output text)
+
+                                NEW_IP=\$(aws ec2 describe-network-interfaces \\
+                                    --network-interface-ids "\$ENI_ID" \\
+                                    --region ${awsRegion} \\
+                                    --query 'NetworkInterfaces[0].Association.PublicIp' \\
+                                    --output text)
+
+                                echo "New task IP: \$NEW_IP"
+
+                                python3 -c "
+import json, subprocess
+change = {
+  'Comment': 'Update ECS Fargate origin IP',
+  'Changes': [{
+    'Action': 'UPSERT',
+    'ResourceRecordSet': {
+      'Name': '${originRecordName}',
+      'Type': 'A',
+      'TTL': 60,
+      'ResourceRecords': [{'Value': '\$NEW_IP'}]
+    }
+  }]
+}
+with open('/tmp/r53-update.json','w') as f:
+    json.dump(change, f)
+print('change written')
+"
+
+                                aws route53 change-resource-record-sets \\
+                                    --hosted-zone-id ${r53HostedZoneId} \\
+                                    --change-batch file:///tmp/r53-update.json \\
+                                    --no-cli-pager
+
+                                echo "✅ Origin record updated to \$NEW_IP"
+                            """
                         }
                     }
                 }
