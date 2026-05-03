@@ -25,28 +25,47 @@ A reusable Jenkins Shared Library that delivers a full CI/CD pipeline for any Ne
 
 ### Library structure
 
-The pipeline logic is split into four focused files, each with a single responsibility:
+Follows the [official Jenkins shared library layout](https://www.jenkins.io/doc/book/pipeline/shared-libraries/#directory-structure):
 
 ```
-vars/
-├── buildNextApp.groovy   — Entry point: pipeline orchestrator (~130 lines)
-├── dockerEcr.groovy      — Docker build + ECR push + lifecycle policy
-├── deployEcs.groovy      — ECS deploy + Route 53 origin IP update + CloudFront invalidation
-└── notifyBuild.groovy    — GitHub commit status checks via the Commit Statuses API
+(root)
+├── vars/                          ← public API — one file per callable step
+│   ├── buildNextApp.groovy        — CI + CD pipeline entry point
+│   ├── rollbackNextApp.groovy     — roll back ECS service to a previous revision
+│   ├── dockerEcr.groovy           — Docker build + ECR push + lifecycle policy
+│   ├── deployEcs.groovy           — ECS deploy + Route 53 update + CloudFront invalidation
+│   └── notifyBuild.groovy         — GitHub/GitLab commit status notifications
+│
+├── src/                           ← reusable Groovy classes (standard package layout)
+│   └── com/moka/
+│       └── AwsUtils.groovy        — shared AWS helpers (get task IP, invalidate CloudFront)
+│
+└── resources/                     ← non-Groovy files loaded via libraryResource()
+    └── scripts/
+        └── update-cf-origin.py    — patch a CloudFront DistributionConfig JSON in-place
 ```
 
-How they relate:
+How the entry points relate:
 
 ```
 buildNextApp
 │
-├── notifyBuild('pending')           ← right after checkout (spinner on PR)
-├── dockerEcr(...)                   ← Docker Build & Push stage
-├── deployEcs(...)                   ← Deploy to AWS stage
-│     ├── ECS service update
-│     ├── Route 53 A record update   (only if route53HostedZoneId is set)
-│     └── CloudFront invalidation    (only if cloudfrontDistributionId is set)
-└── notifyBuild('success'|'failure'|...) ← post block (✅ or ❌ on PR)
+├── notifyBuild('pending')                  ← right after checkout
+├── dockerEcr(...)                          ← Docker Build & Push stage
+├── deployEcs(...)                          ← Deploy to AWS stage
+│     ├── ECS task definition patch + rollout
+│     ├── Route 53 A record update          (only if route53HostedZoneId is set)
+│     └── CloudFront invalidation           (only if cloudfrontDistributionId is set)
+└── notifyBuild('success'|'failure'|...)    ← post block
+
+rollbackNextApp
+│
+├── Resolve target revision                 (auto-detect previous, or use parameter)
+├── aws ecs update-service                  ← point service at previous task def
+├── aws ecs wait services-stable
+└── Update CloudFront origin + invalidate   (only if cloudfrontDistributionId is set)
+      └── AwsUtils.getTaskPublicIp()        ← shared helper
+      └── update-cf-origin.py               ← loaded from resources/
 ```
 
 ---
@@ -55,13 +74,14 @@ buildNextApp
 
 - [How It Works](#how-it-works)
 - [Quick Start](#quick-start)
+- [Rollback](#rollback)
 - [Parameters](#parameters)
 - [Jenkins Setup](#jenkins-setup)
 - [Agent Requirements](#agent-requirements)
 - [Required Credentials](#required-credentials)
 - [IAM Permissions](#iam-permissions)
 - [Pipeline Stages](#pipeline-stages)
-- [GitHub PR Checks](#github-pr-checks)
+- [PR Status Checks](#pr-status-checks)
 - [Architecture](#architecture)
 - [Consuming Repo Example](#consuming-repo-example)
 - [License](#license)
@@ -104,6 +124,73 @@ That is the entire `Jenkinsfile`. No other pipeline code is needed.
 
 ---
 
+## Rollback
+
+Use `rollbackNextApp` to roll back an ECS service to a previous task definition revision without triggering a full CI/CD run.
+
+### Step 1 — Create a Jenkins Pipeline job
+
+1. **New Item → Pipeline** — name it `moka-rollback` (or any name you prefer)
+2. Under **Pipeline**, select **Pipeline script** and paste:
+
+```groovy
+@Library('jenkins-nextjs-lib') _
+
+rollbackNextApp(
+    ecsCluster:               'moka-cluster',
+    ecsService:               'moka-service',
+    awsRegion:                'us-east-1',
+    cloudfrontDistributionId: 'EXXXXXXXXXXXXX',  // optional — omit to skip CloudFront update
+    cloudfrontOriginId:       'ecs-moka'          // optional — default: 'ecs-moka'
+)
+```
+
+3. Save — do **not** trigger it yet.
+
+### Step 2 — Find the revision to roll back to
+
+```bash
+aws ecs list-task-definitions \
+  --family-prefix moka-software-business \
+  --sort DESC \
+  --region us-east-1
+```
+
+Output:
+```
+moka-software-business:5   ← current (broken)
+moka-software-business:4   ← roll back to this
+moka-software-business:3
+```
+
+### Step 3 — Trigger the rollback
+
+1. Go to **Jenkins → moka-rollback → Build with Parameters**
+2. Enter `moka-software-business:4` in the `TASK_DEFINITION_REVISION` field
+3. Click **Build** — or leave the field blank to auto-select the revision one step back
+
+### What rollbackNextApp does
+
+| Stage | Action |
+|---|---|
+| **Resolve Target Revision** | Uses the provided revision or auto-detects `current - 1` |
+| **Roll Back ECS Service** | `aws ecs update-service --task-definition <revision>` + waits for stability |
+| **Update CloudFront Origin** | Resolves the new task's public IP via `AwsUtils`, patches the distribution config with `update-cf-origin.py`, then invalidates the cache — skipped if `cloudfrontDistributionId` is not set |
+
+> **Why Update CloudFront Origin?** Fargate assigns a new public IP to the task on every restart — including rollbacks. Without this stage, CloudFront would still point at the old (now stopped) task's IP.
+
+### Rollback parameters
+
+| Parameter | Required | Default | Description |
+|---|---|---|---|
+| `ecsCluster` | **Yes** | — | ECS cluster name |
+| `ecsService` | **Yes** | — | ECS service name |
+| `awsRegion` | No | `us-east-1` | AWS region |
+| `cloudfrontDistributionId` | No | `''` | CloudFront distribution ID — enables the **Update CloudFront Origin** stage |
+| `cloudfrontOriginId` | No | `'ecs-moka'` | The CloudFront origin ID to update (must match the origin ID in your distribution config) |
+
+---
+
 ## Parameters
 
 | Parameter | Required | Default | Description |
@@ -133,8 +220,8 @@ Go to: **Manage Jenkins → Configure System → Global Trusted Pipeline Librari
 | **Name** | `jenkins-nextjs-lib` |
 | **Default version** | `main` |
 | **Retrieval method** | Modern SCM → Git |
-| **Repository URL** | `https://github.com/mokasofthub/jenkins-nextjs-lib.git` |
-| **Credentials** | *(leave blank for public repo, or add SSH/token for private)* |
+| **Repository URL** | `https://gitlab.com/mokadev26/jenkins-nextjs-lib.git` |
+| **Credentials** | *(leave blank for public repo, or add a GitLab PAT for private)* |
 
 Click **Save**.
 
@@ -149,8 +236,8 @@ Install all of the following (restart Jenkins after):
 | Plugin | Why it is needed |
 |---|---|
 | **Pipeline** | Declarative pipeline support |
-| **GitHub** | Webhook listener (`/github-webhook/`) + push triggers |
-| **GitHub Branch Source** | Multibranch pipeline + PR builds |
+| **GitLab** | Webhook listener + push triggers (`gitlabPush`) |
+| **GitLab Branch Source** | Multibranch pipeline + MR builds |
 | **Credentials Binding** | Inject secrets as environment variables |
 | **Git** | Checkout stage |
 
@@ -169,50 +256,39 @@ Add each credential below as **Secret text**:
 | `aws-access-key-id` | Secret text | Your AWS access key ID |
 | `aws-secret-access-key` | Secret text | Your AWS secret access key |
 | `formspree-form-id` | Secret text | Your Formspree form ID (injected at Docker build time) |
-| `github-token` | Secret text | GitHub Personal Access Token with **`repo:status`** scope — used to post commit statuses |
+| `gitlab-api-token` | Secret text | GitLab Personal Access Token with **`api`** scope — used to post commit statuses |
 
 > **Security note:** Never store AWS credentials in source code or `Jenkinsfile`. The library reads them via `withCredentials` and never prints them to the build log.
 
-#### GitHub Personal Access Token (for commit statuses)
+#### GitLab Personal Access Token (for commit statuses)
 
-1. Go to **GitHub → Settings → Developer settings → Personal access tokens → Tokens (classic)**
-2. Click **Generate new token (classic)**
-3. Set a note (e.g. `jenkins-commit-status`) and select the **`repo:status`** scope (fine-grained: only allows writing commit statuses — no code access needed)
-4. Copy the token and add it to Jenkins as a **Secret text** credential with ID `github-token`
+1. Go to **GitLab → User Settings → Access Tokens**
+2. Click **Add new token**
+3. Set a name (e.g. `jenkins-commit-status`), select the **`api`** scope
+4. Copy the token and add it to Jenkins as a **Secret text** credential with ID `gitlab-api-token`
 
 ---
 
-### Step 4 — Configure the GitHub webhook
+### Step 4 — Configure the GitLab webhook
 
-In your GitHub repository, go to **Settings → Webhooks → Add webhook**:
+In your GitLab repository, go to **Settings → Webhooks → Add new webhook**:
 
 | Field | Value |
 |---|---|
-| **Payload URL** | `http://<your-jenkins-host>:8080/github-webhook/` |
-| **Content type** | `application/json` |
-| **Events** | Push + Pull request |
+| **URL** | `http://<your-jenkins-host>:8080/gitlab-webhook/` |
+| **Secret token** | *(optional — set one and store it in Jenkins as `gitlab-webhook-secret`)* |
+| **Trigger** | Push events + Merge request events |
 
-This makes Jenkins start a build automatically on every push and pull request.
+This makes Jenkins start a build automatically on every push and merge request.
 
 ---
 
 ### Step 5 — Create the Jenkins job
 
 1. Click **New Item** → **Multibranch Pipeline** → OK
-2. Under **Branch Sources**, add your GitHub repository
+2. Under **Branch Sources**, add your GitLab repository
 3. Under **Build Configuration**, set the script path to `Jenkinsfile`
-4. Under **GitHub Project**, set the project URL to `https://github.com/<org>/<repo>/` — required for `githubNotify` to resolve the correct repository
-5. Save — Jenkins will scan all branches and PRs immediately
-
-#### Verify commit status checks are working
-
-1. Open a PR on GitHub — you should see `continuous-integration/jenkins/blue-ocean — pending` appear immediately after checkout
-2. After the build completes, both statuses (`blue-ocean` and `console`) should show ✅ or ❌
-3. Click **Details** on either status → you should land **directly** on the Jenkins Blue Ocean or console page
-4. If statuses do not appear:
-   - Check the build console for `curl` errors (look for `HTTP 401` or `HTTP 422`)
-   - Verify `github-token` is a PAT with `repo:status` scope
-   - Confirm `env.GIT_COMMIT` and `env.GIT_URL` are set (always true after `checkout scm`)
+4. Save — Jenkins will scan all branches and MRs immediately
 
 ---
 
@@ -342,7 +418,7 @@ The AWS IAM user whose keys are stored in Jenkins needs the following minimum pe
 
 ---
 
-## GitHub PR Checks
+## PR Status Checks
 
 The library posts two **commit statuses** per build via `curl` against the [GitHub Statuses API](https://docs.github.com/en/rest/commits/statuses). Unlike the Checks API, commit statuses redirect **directly** to Jenkins when clicking Details.
 
@@ -452,7 +528,7 @@ This keeps storage costs under $0.10/month regardless of how often you deploy.
 
 ## Consuming Repo Example
 
-The [`moka-software-business`](https://github.com/mokasofthub/moka-software-busness) portfolio site is the reference consumer of this library. Its full `Jenkinsfile`:
+The [`moka-software-business`](https://gitlab.com/mokadev26/moka-software-business) portfolio site is the reference consumer of this library. Its full `Jenkinsfile`:
 
 ```groovy
 @Library('jenkins-nextjs-lib') _
@@ -464,9 +540,10 @@ buildNextApp(
     ecsCluster:               'moka-cluster',
     ecsService:               'moka-service',
     containerName:            'moka-software-business',
-    cloudfrontDistributionId: 'E2MZ1JOJMAKL7T',
-    route53HostedZoneId:      'Z060171628JQ5P7XSLA4C',
-    originRecordName:         'origin.mokasoftwarebusness.com',
+    // cloudfrontDistributionId: uncomment and set once CloudFront is created
+    // cloudfrontDistributionId: 'EXXXXXXXXXXXXX',
+    // route53HostedZoneId:      'ZXXXXXXXXXXXXX',
+    // originRecordName:         'origin.mokasoftwarebusness.com',
 )
 ```
 
